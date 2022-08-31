@@ -29,10 +29,24 @@ package com.sun.javatest;
 import com.sun.javatest.util.BackupPolicy;
 import com.sun.javatest.util.I18NResourceBundle;
 
+import static java.lang.Double.compare;
+import static java.lang.System.out;
+import static java.util.stream.Collectors.toConcurrentMap;
+
 import java.io.PrintWriter;
+import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.Map.Entry;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 /**
  * Traditional implementation of the test execution engine which has been
@@ -50,16 +64,60 @@ public class DefaultTestRunner extends TestRunner {
     private Set<Thread> activeThreads;
     private boolean allPassed;
     private boolean stopping;
+    Set<TestDescription> running = ConcurrentHashMap.newKeySet();
+
+    private boolean fit(Set<TestDescription> running, TestDescription test, double cpuLoadTarget, long memoryTarget) {
+        double cpuLoad = running.stream().map(t -> ProcessData.get(t).cpuUsageSecond / ProcessData.get(t).cpuWallSeconds).reduce(0.0, Double::sum);
+        long memUsage = running.stream().map(t -> ProcessData.get(t).memUsageInBytes).reduce(0l, Long::sum);
+
+        return ProcessData.get(test).memUsageInBytes + memUsage <= memoryTarget
+            && ProcessData.get(test).cpuUsageSecond + cpuLoad <= cpuLoadTarget;
+    }
+
+    private static double priority(TestDescription test) {
+        return ProcessData.get(test).memUsageInBytes * ProcessData.get(test).cpuWallSeconds;
+    }
+
+    private Iterator<TestDescription> schedule(Iterator<TestDescription> testIter) {
+        if (System.getenv("SCHEDULE") == null) {
+            return testIter;
+        }
+
+        long memoryTarget = Long.valueOf(Optional.ofNullable(System.getenv("MAXMEM")).orElse("8000000000"));
+        double cpuLoadTarget = getConcurrency();
+
+        List<TestDescription> leftToRun = new ArrayList<>();
+        testIter.forEachRemaining(leftToRun::add);
+        leftToRun.sort((a, b) -> compare(priority(a), priority(b)));
+
+        return new Iterator<TestDescription>() {
+            @Override
+            public boolean hasNext() {
+                return !leftToRun.isEmpty();
+            }
+            @Override
+            public TestDescription next() {
+                TestDescription selected = Stream.generate(() -> {
+                        Set<TestDescription> snapshot = new HashSet<>(running);
+                        return leftToRun.stream().filter(test -> fit(snapshot, test, cpuLoadTarget, memoryTarget)).findFirst();})
+                    .flatMap(Optional::stream)
+                    .findFirst()
+                    .get();
+
+                running.add(selected);
+                return selected;
+            }
+        };
+    }
 
     @Override
     public synchronized boolean runTests(Iterator<TestDescription> testIter)
             throws InterruptedException {
-        this.testIter = testIter;
+        this.testIter = schedule(testIter);
 
         Thread[] threads = new Thread[getConcurrency()];
         activeThreads = new HashSet<>();
         allPassed = true;
-
         try {
             int n = 0;
             while (!stopping) {
@@ -74,6 +132,7 @@ public class DefaultTestRunner extends TestRunner {
                                     TestDescription td;
                                     while ((td = nextTest()) != null) {
                                         if (!runTest(td)) {
+                                            running.remove(td);
                                             allPassed = false;
                                         }
                                     }
@@ -249,6 +308,67 @@ public class DefaultTestRunner extends TestRunner {
             return ERROR;
         } else {
             return THROWABLE;
+        }
+    }
+
+    static class ProcessData {
+        public int exitCode;
+        public double cpuUsageSecond;
+        public double cpuWallSeconds;
+        public long memUsageInBytes;
+
+        public ProcessData(int exitCode, double cpuUsageSecond, double cpuWallSeconds, long memUsageInBytes) {
+            this.exitCode = exitCode;
+            this.cpuUsageSecond = cpuUsageSecond;
+            this.cpuWallSeconds = cpuWallSeconds;
+            this.memUsageInBytes = memUsageInBytes;
+        }
+
+        public String toString() {
+            return exitCode
+                + " " + cpuUsageSecond
+                + " " + cpuWallSeconds
+                + " " + memUsageInBytes;
+        }
+
+        public static Entry<String, ProcessData> fromString(String str) {
+            String[] strs = str.split(" ");
+            return Map.entry(strs[0], new ProcessData(Integer.valueOf(strs[1]),
+                                                      Double.valueOf(strs[2]),
+                                                      Double.valueOf(strs[3]),
+                                                      Long.valueOf(strs[4])));
+        }
+
+        private static Stream<String> lines(Path path) {
+            try {
+                return Files.lines(path, Charset.forName("UTF-8"));
+            } catch (Exception e) {
+                e.printStackTrace();
+                throw new Error(e);
+            }
+        }
+
+        private static Map<String, ProcessData> readProcessData(Path p) {
+            return lines(p)
+                .map(ProcessData::fromString)
+                .collect(toConcurrentMap(Entry::getKey, Entry::getValue,
+                                         (a, b) -> a.memUsageInBytes > b.memUsageInBytes ? a : b));
+        }
+
+        public static Map<String, ProcessData> testProcessData;
+
+        public static ProcessData get(TestDescription td) {
+            return testProcessData.get(td.toString()); //TODO WRONG!!!
+        }
+
+        static {
+            out.println("lkorinth: begin static");
+            try {
+                testProcessData = readProcessData(Path.of("/home/lkorinth/bisect"));
+            } catch (Exception e) {
+                out.println("lkorinth catch:" + e);
+            }
+            out.println("lkorinth: end static");
         }
     }
 }
