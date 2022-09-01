@@ -31,6 +31,7 @@ import com.sun.javatest.util.I18NResourceBundle;
 
 import static java.lang.Double.compare;
 import static java.lang.System.out;
+import static java.util.Optional.ofNullable;
 import static java.util.stream.Collectors.toConcurrentMap;
 
 import java.io.PrintWriter;
@@ -66,25 +67,43 @@ public class DefaultTestRunner extends TestRunner {
     private boolean stopping;
     Set<TestDescription> running = ConcurrentHashMap.newKeySet();
 
-    private boolean fit(Set<TestDescription> running, TestDescription test, double cpuLoadTarget, long memoryTarget) {
+    /**
+     * A test case is fit to run if the sum of the resources used by
+     * <b>running</b> and <b>test</b> is less than the given target.
+     *
+     * @return true iff resource target is not broken
+     */
+    private boolean fit(Set<TestDescription> running, TestDescription test, double cpuLoadTarget, long memoryTarget, long maxHeapSize) {
         double cpuLoad = running.stream().map(t -> ProcessData.get(t).cpuUsageSecond / ProcessData.get(t).cpuWallSeconds).reduce(0.0, Double::sum);
         long memUsage = running.stream().map(t -> ProcessData.get(t).memUsageInBytes).reduce(0l, Long::sum);
 
-        return ProcessData.get(test).memUsageInBytes + memUsage <= memoryTarget
+        return ProcessData.get(test).memUsageInBytes + memUsage + maxHeapSize /*sameVM*/ <= memoryTarget
             && ProcessData.get(test).cpuUsageSecond + cpuLoad <= cpuLoadTarget;
     }
 
+    /**
+     * The priority is the product of wall time and memory
+     * usage. Tests that uses much memory and wall time are hard to
+     * schedule, so schedule them first.
+     */
     private static double priority(TestDescription test) {
         return ProcessData.get(test).memUsageInBytes * ProcessData.get(test).cpuWallSeconds;
     }
 
+    /**
+     * Schedule returns an iterator that gives the order of test cases
+     * to run. If we can not reach resource targets, the iterator will
+     * block untill enough resources are available. TODO, <b>next()</b> is
+     * bussy waiting at the moment, fix this to consume less cpu.
+     */
     private Iterator<TestDescription> schedule(Iterator<TestDescription> testIter) {
         if (System.getenv("SCHEDULE") == null) {
             return testIter;
         }
 
-        long memoryTarget = Long.valueOf(Optional.ofNullable(System.getenv("MAXMEM")).orElse("8000000000"));
-        double cpuLoadTarget = getConcurrency();
+        final long memoryTarget = ofNullable(System.getenv("MAXMEM")).map(Long::valueOf).orElse(8_000_000_000L);
+        final double cpuLoadTarget = ofNullable(System.getenv("MAXLOAD")).map(Double::valueOf).orElse(1.0 * getConcurrency());
+        final long maxHeapSize = (long) (Runtime.getRuntime().maxMemory() * 1.4);
 
         List<TestDescription> leftToRun = new ArrayList<>();
         testIter.forEachRemaining(leftToRun::add);
@@ -99,7 +118,7 @@ public class DefaultTestRunner extends TestRunner {
             public TestDescription next() {
                 TestDescription selected = Stream.generate(() -> {
                         Set<TestDescription> snapshot = new HashSet<>(running);
-                        return leftToRun.stream().filter(test -> fit(snapshot, test, cpuLoadTarget, memoryTarget)).findFirst();})
+                        return leftToRun.stream().filter(test -> fit(snapshot, test, cpuLoadTarget, memoryTarget, maxHeapSize)).findFirst();})
                     .flatMap(Optional::stream)
                     .findFirst()
                     .get();
