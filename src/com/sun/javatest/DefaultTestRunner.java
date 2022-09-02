@@ -74,6 +74,7 @@ public class DefaultTestRunner extends TestRunner {
      * @return true iff resource target is not broken
      */
     private boolean fit(Set<TestDescription> running, TestDescription test, double cpuLoadTarget, long memoryTarget, long maxHeapSize) {
+        out.println("lkorinth:"  + test.getName());
         double cpuLoad = running.stream().map(t -> ProcessData.get(t).cpuUsageSecond / ProcessData.get(t).cpuWallSeconds).reduce(0.0, Double::sum);
         long memUsage = running.stream().map(t -> ProcessData.get(t).memUsageInBytes).reduce(0l, Long::sum);
 
@@ -258,7 +259,7 @@ public class DefaultTestRunner extends TestRunner {
 
             result = s.getTestResult();
 
-            s.run();
+            //s.run(); lkorinth
         } catch (ThreadDeath e) {
             String url = td.getRootRelativeURL();
             workDir.log(i18n, "dtr.threadKilled", url);
